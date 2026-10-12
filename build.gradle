@@ -1,0 +1,60 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+version = mod_version
+group = mod_group_id
+
+repositories {
+    mavenCentral()
+}
+
+base {
+    archivesName = 'sableautoload'
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = project.neo_version
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    // Decoding the Sable API needs the mod jar plus the jars Sable bundles through Jar-in-Jar
+    // (dev.ryanhcode.sable.companion.math lives in sable-companion-common).
+    compileOnly files("libs/sable-neoforge-1.21.1-2.0.6.jar")
+    compileOnly files("libs/sable-companion-common-1.21.1-1.6.0.jar")
+    compileOnly files("libs/veil-neoforge-1.21.1-4.3.2.jar")
+}
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            neo_version_range      : neo_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar) {
+    archiveFileName = "${mod_id}-${project.mod_version}.jar"
+}
