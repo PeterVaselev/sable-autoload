@@ -4,11 +4,13 @@ import com.mojang.logging.LogUtils;
 import dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer;
 import dev.ryanhcode.sable.api.sublevel.SubLevelContainer;
 import dev.ryanhcode.sable.api.sublevel.ticket.SubLevelLoadingTicket;
+import dev.ryanhcode.sable.api.sublevel.ticket.SubLevelTicketInfo;
 import dev.ryanhcode.sable.companion.math.BoundingBox3d;
 import dev.ryanhcode.sable.companion.math.BoundingBox3dc;
 import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
 import dev.ryanhcode.sable.sublevel.SubLevel;
+import dev.ryanhcode.sable.sublevel.storage.SubLevelTicketsSavedData;
 import net.minecraft.core.SectionPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -18,6 +20,7 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.joml.Vector3dc;
@@ -107,12 +110,14 @@ public final class AutoLoadManager {
      */
     private void updatePlayer(MinecraftServer server, ServerPlayer player) {
         final UUID playerId = player.getUUID();
-        // Sub-level containers are per dimension, so a player only ever loads sub-levels of their own level.
         final ServerLevel level = player.serverLevel();
         final ServerSubLevelContainer container = SubLevelContainer.getContainer(level);
         if (container == null) {
             return;
         }
+
+        // Release this player's tickets held by dimensions they are no longer in.
+        this.releaseMatching(server, ticket -> playerId.equals(ticket.key()), container);
 
         final int radiusChunks = SableAutoLoadGameRules.radiusChunks(server);
         if (radiusChunks <= 0) {
@@ -140,6 +145,7 @@ public final class AutoLoadManager {
         // Release pass. The container's own ticket data is authoritative and gives us the loaded
         // ServerSubLevel instances needed to remove a ticket.
         final List<ReleaseTarget> toRelease = new ArrayList<>();
+        final Set<UUID> scheduledForRelease = new HashSet<>();
         final Set<UUID> heldNow = new HashSet<>();
         for (final Map.Entry<ServerSubLevel, Set<SubLevelLoadingTicket<?>>> entry : container.collectForceLoadTickets().entrySet()) {
             final ServerSubLevel sub = entry.getKey();
@@ -157,15 +163,41 @@ public final class AutoLoadManager {
             heldNow.add(subId);
             if (!stillNear.contains(subId) || distanceSq(sub, px, py, pz) > releaseRangeSq) {
                 toRelease.add(new ReleaseTarget(sub, key));
+                scheduledForRelease.add(subId);
             }
         }
 
-        // Forget bookkeeping for sub-levels this mod no longer holds a ticket for.
-        mine.retainAll(heldNow);
+        // A reduced max applies immediately. Keep the nearest retained tickets, preserving
+        // hysteresis for those still inside the release box, and release the rest.
+        final List<ServerSubLevel> retained = new ArrayList<>();
+        for (final ServerSubLevel sub : container.getAllSubLevels()) {
+            if (heldNow.contains(sub.getUniqueId()) && stillNear.contains(sub.getUniqueId())
+                    && distanceSq(sub, px, py, pz) <= releaseRangeSq) {
+                retained.add(sub);
+            }
+        }
+        retained.sort(Comparator.comparingDouble(sub -> distanceSq(sub, px, py, pz)));
+        final Set<UUID> keep = new HashSet<>();
+        for (int i = 0; i < Math.min(Math.max(max, 0), retained.size()); i++) {
+            keep.add(retained.get(i).getUniqueId());
+        }
+        for (final Map.Entry<ServerSubLevel, Set<SubLevelLoadingTicket<?>>> entry : container.collectForceLoadTickets().entrySet()) {
+            final ServerSubLevel sub = entry.getKey();
+            if (entry.getValue().stream().anyMatch(ticket -> isAutoTicket(ticket) && playerId.equals(ticket.key()))
+                    && !keep.contains(sub.getUniqueId()) && scheduledForRelease.add(sub.getUniqueId())) {
+                toRelease.add(new ReleaseTarget(sub, playerId));
+            }
+        }
 
         for (final ReleaseTarget target : toRelease) {
-            if (container.removeForceLoadTicket(target.subLevel(), AutoLoadTickets.AUTO, target.key())) {
-                mine.remove(target.subLevel().getUniqueId());
+            container.removeForceLoadTicket(target.subLevel(), AutoLoadTickets.AUTO, target.key());
+        }
+
+        // Rebuild from the ticket map: removals can fail or there can be old bookkeeping.
+        mine.clear();
+        for (final Map.Entry<ServerSubLevel, Set<SubLevelLoadingTicket<?>>> entry : container.collectForceLoadTickets().entrySet()) {
+            if (entry.getValue().stream().anyMatch(ticket -> isAutoTicket(ticket) && playerId.equals(ticket.key()))) {
+                mine.add(entry.getKey().getUniqueId());
             }
         }
 
@@ -229,10 +261,15 @@ public final class AutoLoadManager {
      * Releases every auto-load ticket whose key matches the predicate, in all dimensions of the server.
      */
     private int releaseMatching(MinecraftServer server, Predicate<SubLevelLoadingTicket<?>> match) {
+        return this.releaseMatching(server, match, null);
+    }
+
+    private int releaseMatching(MinecraftServer server, Predicate<SubLevelLoadingTicket<?>> match,
+                                ServerSubLevelContainer keepContainer) {
         int removed = 0;
         for (final ServerLevel level : server.getAllLevels()) {
             final ServerSubLevelContainer container = SubLevelContainer.getContainer(level);
-            if (container == null) {
+            if (container == null || container == keepContainer) {
                 continue;
             }
             final List<ReleaseTarget> targets = new ArrayList<>();
@@ -253,14 +290,36 @@ public final class AutoLoadManager {
         return removed;
     }
 
+    /** Removes records for auto tickets whose sub-level is currently inactive, which the public
+     * removeForceLoadTicket API cannot address because it requires a live ServerSubLevel instance. */
+    private int clearInactiveTickets(MinecraftServer server, Predicate<SubLevelLoadingTicket<?>> match) {
+        int removed = 0;
+        for (final ServerLevel level : server.getAllLevels()) {
+            final ServerSubLevelContainer container = SubLevelContainer.getContainer(level);
+            if (container == null) continue;
+            int levelRemoved = 0;
+            for (final Map.Entry<UUID, SubLevelTicketInfo> entry : container.getAllTickets().entrySet()) {
+                if (container.getSubLevel(entry.getKey()) != null) continue;
+                final SubLevelTicketInfo info = entry.getValue();
+                final int before = info.tickets().size();
+                info.tickets().removeIf(ticket -> isAutoTicket(ticket) && match.test(ticket));
+                final int removedFromEntry = before - info.tickets().size();
+                levelRemoved += removedFromEntry;
+                // getAllTickets() is an unmodifiable map. A null pointer safely prevents
+                // Sable's initialize() from loading an otherwise empty entry; save() omits it.
+                if (removedFromEntry > 0 && info.tickets().isEmpty()) info.setPointer(null);
+            }
+            removed += levelRemoved;
+            if (levelRemoved > 0) SubLevelTicketsSavedData.getOrLoad(level).setDirty();
+        }
+        return removed;
+    }
+
     /**
-     * Clears the tickets persisted by previous sessions so a restart always starts from a clean slate.
+     * Clears remaining tickets persisted by previous sessions after Sable has initialized containers.
      * <p>
-     * Sable force-loads every sub-level that has persisted ticket data while the level is being
-     * constructed ({@code ServerSubLevelContainer#initialize}), which happens before either server
-     * lifecycle event, so this also serves as the recovery path for a session that was started with
-     * stale auto-load tickets. Both events are handled because dimensions created between them bring
-     * up their own container and their own saved tickets.
+     * Sable 2.0.6 loads persisted tickets from ServerSubLevelContainer.initialize(), before these
+     * events. This cleanup cannot prevent loading on this boot; it only clears records for future boots.
      */
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
@@ -277,10 +336,17 @@ public final class AutoLoadManager {
     }
 
     private void clearPersistedTickets(MinecraftServer server, String phase) {
-        final int removed = this.releaseMatching(server, ticket -> true);
+        final int removed = this.releaseMatching(server, AutoLoadManager::isAutoTicket)
+                + this.clearInactiveTickets(server, ticket -> true);
         if (removed > 0) {
             LOGGER.info("Sable AutoLoad: cleared {} auto-load ticket(s) persisted by a previous session ({})", removed, phase);
         }
+    }
+
+    @SubscribeEvent
+    public void onServerStopping(ServerStoppingEvent event) {
+        this.releaseMatching(event.getServer(), AutoLoadManager::isAutoTicket);
+        this.clearInactiveTickets(event.getServer(), ticket -> true);
     }
 
     @SubscribeEvent
@@ -304,7 +370,8 @@ public final class AutoLoadManager {
             return;
         }
         final UUID playerId = player.getUUID();
-        final int removed = this.releaseMatching(server, ticket -> playerId.equals(ticket.key()));
+        final int removed = this.releaseMatching(server, ticket -> playerId.equals(ticket.key()))
+                + this.clearInactiveTickets(server, ticket -> playerId.equals(ticket.key()));
         this.tracked.remove(playerId);
         this.lastLoggedAmount.remove(playerId);
         LOGGER.info("Sable AutoLoad: released {} auto-load ticket(s) for {} (logged out)", removed, player.getScoreboardName());
